@@ -19,16 +19,34 @@ const hostOk = (h) => HOSTS.some((d) => h === d || h.endsWith('.' + d));
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '10kb' }));
-app.use(cors({
-  origin: ALLOWED.includes('*') ? true : (origin, cb) => cb(null, !origin || ALLOWED.includes(origin)),
-}));
 
+// CORS: reflect the request origin if the list is '*', otherwise check against the allowlist.
+// We allow no-origin requests (curl, server-to-server) but let the browser see that it's allowed.
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // no Origin header: curl, same-origin, etc.
+    if (ALLOWED.includes('*')) return cb(null, true);
+    if (ALLOWED.includes(origin)) return cb(null, true);
+    return cb(null, false); // not allowed
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept'],
+  credentials: false,
+  maxAge: 86400
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // explicit preflight for all paths
+
+// Rate limit per IP. Returns a 429 with the standard shape.
 const hits = new Map();
 app.use('/api', (req, res, next) => {
   const now = Date.now();
   const rec = hits.get(req.ip);
   if (!rec || now > rec.reset) hits.set(req.ip, { n: 1, reset: now + 60000 });
-  else if (++rec.n > 30) return res.status(429).json({ ok: false, error: 'Too many requests. Wait a minute.' });
+  else if (++rec.n > 30) {
+    res.set('retry-after', '60');
+    return res.status(429).json({ ok: false, error: 'Too many requests. Wait a minute.' });
+  }
   next();
 });
 setInterval(() => { const n = Date.now(); for (const [k, v] of hits) if (n > v.reset) hits.delete(k); }, 60000).unref();
@@ -115,7 +133,7 @@ async function cnyToUsd() {
     if (j && j.rates && j.rates.USD) rateCache = { rate: j.rates.USD, at: Date.now(), live: true };
     else throw new Error('no rate');
   } catch {
-    rateCache = { rate: FALLBACK_RATE, at: Date.now() - 5 * 3600 * 1000, live: false }; // retry in about 1 hour
+    rateCache = { rate: FALLBACK_RATE, at: Date.now() - 5 * 3600 * 1000, live: false };
   }
   return rateCache;
 }
@@ -126,7 +144,12 @@ async function weidian(id) {
   try {
     const param = encodeURIComponent(JSON.stringify({ itemId: String(id) }));
     const r = await fetch('https://thor.weidian.com/detail/getItemSkuInfo/1.0?param=' + param, {
-      headers: { 'user-agent': UA, accept: 'application/json', origin: 'https://weidian.com', referer: 'https://weidian.com/item.html?itemID=' + id },
+      headers: {
+        'user-agent': UA,
+        accept: 'application/json',
+        origin: 'https://weidian.com',
+        referer: 'https://weidian.com/item.html?itemID=' + id
+      },
     });
     const j = await r.json();
     const res = j && j.result;
@@ -138,7 +161,9 @@ async function weidian(id) {
       out.image = fixUrl(findKey(res, ['itemMainPic', 'mainPic', 'itemImg', 'itemImage', 'imgUrl', 'imageUrl', 'img'])) || out.images[0] || '';
       out.price = parsePrice(findKey(res, ['itemDiscountLowPrice', 'itemLowPrice', 'itemPrice', 'discountPrice', 'lowPrice', 'price']));
     }
-  } catch { /* fall through to HTML */ }
+  } catch (e) {
+    if (DEBUG_RAW) console.error('weidian api failed:', e.message);
+  }
 
   if (!out.name || !out.price) {
     try {
@@ -147,7 +172,9 @@ async function weidian(id) {
       out.name = out.name || metaTag(html, 'og:title') || (html.match(/<title>([^<]*)<\/title>/i) || [])[1] || '';
       out.image = out.image || fixUrl(metaTag(html, 'og:image'));
       out.price = out.price || parsePrice(metaTag(html, 'og:price:amount') || metaTag(html, 'product:price:amount'));
-    } catch { /* ignore */ }
+    } catch (e) {
+      if (DEBUG_RAW) console.error('weidian html failed:', e.message);
+    }
   }
   return out;
 }
@@ -176,7 +203,7 @@ async function taobao(id) {
     try { json = JSON.parse(text.replace(/^[^({]*\(/, '').replace(/\)\s*;?\s*$/, '') || text); } catch { try { json = JSON.parse(text); } catch { json = null; } }
     const ret = json && json.ret ? json.ret.join(',') : '';
     if (/SUCCESS/.test(ret)) break;
-    if (/TOKEN_EMPTY|TOKEN_EXOIRED|TOKEN_EXPIRED/.test(ret)) continue; // cookie handshake, retry
+    if (/TOKEN_EMPTY|TOKEN_EXOIRED|TOKEN_EXPIRED/.test(ret)) continue;
     break;
   }
   const ret = json && json.ret ? json.ret.join(',') : '';
@@ -232,8 +259,16 @@ async function getProduct(rawUrl) {
 }
 
 /* ---------------- routes ---------------- */
-app.get('/', (req, res) => res.json({ name: 'larplocks-product-api', usage: 'GET /api/product?url=<link>' }));
-app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Fast connectivity check. Use this from the frontend on page load.
+app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+app.get('/', (req, res) => res.json({
+  name: 'larplocks-product-api',
+  usage: 'GET /api/product?url=<weidian-or-taobao-link>',
+  health: '/health'
+}));
 
 async function handle(req, res) {
   const url = (req.body && req.body.url) || req.query.url;
@@ -242,11 +277,21 @@ async function handle(req, res) {
     res.json(await getProduct(url));
   } catch (e) {
     const status = e.status || 500;
-    if (status === 500) console.error(e);
+    if (status === 500) console.error('[lookup] unhandled:', e);
     res.status(status).json({ ok: false, error: status === 500 ? 'Server error. Try again.' : e.message });
   }
 }
 app.get('/api/product', handle);
 app.post('/api/product', handle);
+
+// 404 for anything else under /api so the frontend gets JSON, not HTML
+app.use('/api', (req, res) => res.status(404).json({ ok: false, error: 'Unknown API route.' }));
+
+// Final error handler: always JSON, always with CORS headers already applied by middleware.
+app.use((err, req, res, next) => {
+  console.error('[express] unhandled:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ ok: false, error: 'Server error. Try again.' });
+});
 
 app.listen(PORT, '0.0.0.0', () => console.log('Product API listening on ' + PORT));
